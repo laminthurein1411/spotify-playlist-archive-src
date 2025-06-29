@@ -7,6 +7,8 @@ import datetime
 import json
 from typing import List, Optional, Sequence
 
+from spotify import SpotifyRecentlyPlayedTrack
+
 
 @dataclasses.dataclass(frozen=True)
 class Owner:
@@ -405,7 +407,7 @@ class PlayHistoryForDate:
 
     def update(
         self,
-        recently_played: Sequence[RecentlyPlayedTrack],
+        recently_played: Sequence[SpotifyRecentlyPlayedTrack],
     ) -> PlayHistoryForDate:
         # First, ensure existing tracks are sorted
         tracks = list(self.tracks)
@@ -423,10 +425,31 @@ class PlayHistoryForDate:
                 after_datetime = track.played_at
 
         # Append new tracks
-        for track in recently_played:
-            if after_datetime is not None and track.played_at <= after_datetime:
+        for item in recently_played:
+            if after_datetime is not None and item.played_at <= after_datetime:
                 continue
-            tracks.append(track)
+            tracks.append(
+                RecentlyPlayedTrack(
+                    url=item.track.url,
+                    name=item.track.name,
+                    album=Album(
+                        url=item.track.album.url,
+                        name=item.track.album.name,
+                    ),
+                    artists=[
+                        Artist(
+                            url=artist.url,
+                            name=artist.name,
+                        )
+                        for artist in item.track.artists
+                    ],
+                    popularity=item.track.popularity,
+                    duration_ms=item.track.duration_ms,
+                    context_type=(item.context.type_ or "") if item.context else "",
+                    context_url=(item.context.url or "") if item.context else "",
+                    played_at=item.played_at,
+                )
+            )
 
         return PlayHistoryForDate(date=self.date, tracks=tracks)
 

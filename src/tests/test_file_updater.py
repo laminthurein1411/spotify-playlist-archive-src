@@ -8,17 +8,23 @@ from typing import Optional, TypeVar
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, Mock, call, patch, sentinel
 
-from alias import Alias
 from file_manager import FileManager, MalformedAliasError, UnexpectedFilesError
 from file_updater import FileUpdater
 from plants.unittest_utils import UnittestUtils
 from playlist_id import PlaylistID
-from playlist_types import Album, Artist, Owner, Playlist, RecentlyPlayedTrack, Track
+from playlist_types import Album, Artist, Owner, Playlist, Track
 from spotify import (
     RequestFailedError,
     RequestRetryBudgetExceededError,
     ResourceNotFoundError,
     RetryBudget,
+    SpotifyAlbum,
+    SpotifyArtist,
+    SpotifyContext,
+    SpotifyOwner,
+    SpotifyPlaylist,
+    SpotifyRecentlyPlayedTrack,
+    SpotifyTrack,
 )
 
 T = TypeVar("T")
@@ -154,18 +160,17 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
     def _helper(
         cls,
         playlist_id: PlaylistID,
-        original_name: str,
+        name: str,
         num_followers: int,
-    ) -> Playlist:
-        return Playlist(
+    ) -> SpotifyPlaylist:
+        return SpotifyPlaylist(
             url=f"url_{playlist_id}",
-            original_name=original_name,
-            unique_name=original_name,
+            name=name,
             description="description",
             tracks=[],
             snapshot_id="snapshot_id",
             num_followers=num_followers,
-            owner=Owner(
+            owner=SpotifyOwner(
                 url="owner_url",
                 name="owner_name",
             ),
@@ -176,12 +181,11 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
         cls,
         playlist_id: PlaylistID,
         *,
-        alias: Optional[Alias],
         retry_budget: Optional[RetryBudget] = None,
-    ) -> Playlist:
+    ) -> SpotifyPlaylist:
         return cls._helper(
             playlist_id=playlist_id,
-            original_name=alias or f"name_{playlist_id}",
+            name=f"name_{playlist_id}",
             num_followers=0,
         )
 
@@ -247,8 +251,7 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
         await self._update_files_impl()
         args, kwargs = self.mock_spotify.get_playlist.call_args
         self.assertEqual(args, ("foo",))
-        self.assertEqual(len(kwargs), 2)
-        self.assertEqual(kwargs["alias"], "alias")
+        self.assertEqual(len(kwargs), 1)
         self.assertEqual(kwargs["retry_budget"].get_initial_seconds(), 5)
         with open(self.playlists_dir / "plain" / "foo", "r") as f:
             lines = f.read().splitlines()
@@ -256,24 +259,14 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
 
     async def test_duplicate_playlist_names(self) -> None:
         self.mock_spotify.get_playlist.side_effect = [
-            self._helper(
-                playlist_id=PlaylistID("a"), original_name="name", num_followers=1
-            ),
-            self._helper(
-                playlist_id=PlaylistID("b"), original_name="name", num_followers=2
-            ),
-            self._helper(
-                playlist_id=PlaylistID("c"), original_name="name", num_followers=2
-            ),
-            self._helper(
-                playlist_id=PlaylistID("d"), original_name="name (3)", num_followers=0
-            ),
-            self._helper(
-                playlist_id=PlaylistID("e"), original_name="name (3)", num_followers=0
-            ),
+            self._helper(playlist_id=PlaylistID("a"), name="name", num_followers=1),
+            self._helper(playlist_id=PlaylistID("b"), name="name", num_followers=2),
+            self._helper(playlist_id=PlaylistID("c"), name="name", num_followers=2),
+            self._helper(playlist_id=PlaylistID("d"), name="name (3)", num_followers=0),
+            self._helper(playlist_id=PlaylistID("e"), name="name (3)", num_followers=0),
             self._helper(
                 playlist_id=PlaylistID("f"),
-                original_name="name (3) (2)",
+                name="name (3) (2)",
                 num_followers=1,
             ),
         ]
@@ -328,8 +321,8 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
 
         self.mock_spotify.get_playlist.side_effect = UnittestUtils.side_effect(
             [
-                self._fake_get_playlist(PlaylistID("a"), alias=None),
-                self._fake_get_playlist(PlaylistID("b"), alias=None),
+                self._fake_get_playlist(PlaylistID("a")),
+                self._fake_get_playlist(PlaylistID("b")),
                 ResourceNotFoundError(),
                 RequestRetryBudgetExceededError(),
             ]
@@ -347,10 +340,42 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
         pretty_dir.mkdir(parents=True)
         for playlist_id in "ac":
             path = pretty_dir / f"{playlist_id}.json"
-            playlist = self._helper(
+            spotify_playlist = self._helper(
                 playlist_id=PlaylistID(playlist_id),
-                original_name=f" name_{playlist_id} ",  # ensure whitespace is stripped
+                name=f" name_{playlist_id} ",  # ensure whitespace is stripped
                 num_followers=0,
+            )
+            playlist = Playlist(
+                url=spotify_playlist.url,
+                original_name=spotify_playlist.name,
+                unique_name=spotify_playlist.name,
+                description=spotify_playlist.description,
+                tracks=[
+                    Track(
+                        url=track.url,
+                        name=track.name,
+                        album=Album(
+                            url=track.album.url,
+                            name=track.album.name,
+                        ),
+                        artists=[
+                            Artist(
+                                url=artist.url,
+                                name=artist.name,
+                            )
+                            for artist in track.artists
+                        ],
+                        duration_ms=track.duration_ms,
+                        added_at=track.added_at,
+                    )
+                    for track in spotify_playlist.tracks
+                ],
+                snapshot_id=spotify_playlist.snapshot_id,
+                num_followers=spotify_playlist.num_followers,
+                owner=Owner(
+                    url=spotify_playlist.owner.url,
+                    name=spotify_playlist.owner.name,
+                ),
             )
             playlist_json = playlist.to_json()
             with open(path, "w") as f:
@@ -493,36 +518,36 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
             pass
 
         # Create a fake playlist
-        playlist = Playlist(
+        playlist = SpotifyPlaylist(
             url="playlist_url",
-            original_name="playlist_original_name",
-            unique_name="playlist_unique_name",
+            name="playlist_name",
             description="playlist_description",
             tracks=[
-                Track(
+                SpotifyTrack(
                     url="trackurl",
                     name="track_name",
-                    album=Album(
+                    album=SpotifyAlbum(
                         url="album_url",
                         name="album_name",
                     ),
                     artists=[
-                        Artist(
+                        SpotifyArtist(
                             url="artist_one_url",
                             name="artist_one_name",
                         ),
-                        Artist(
+                        SpotifyArtist(
                             url="artist_two_url",
                             name="artist_two_name",
                         ),
                     ],
                     duration_ms=12345,
+                    popularity=71,
                     added_at=self.now,
                 )
             ],
             snapshot_id="playlist_snapshot_id",
             num_followers=999,
-            owner=Owner(
+            owner=SpotifyOwner(
                 url="owner_url",
                 name="owner_name",
             ),
@@ -573,7 +598,7 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
                     {
                       "date_first_scraped": "2021-12-15",
                       "description": "playlist_description",
-                      "name": "playlist_unique_name",
+                      "name": "playlist_name",
                       "tracks": [
                         {
                           "album": {
@@ -612,7 +637,7 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
                 # on every line, even the empty ones
                 r"""[pretty](/playlists/pretty/abc.md) - cumulative - [plain](/playlists/plain/abc) - [githistory](base/plain/abc)
 
-### [playlist\_unique\_name](playlist_url)
+### [playlist\_name](playlist_url)
 
 > playlist\_description
 
@@ -644,7 +669,7 @@ class TestUpdateFilesImpl(IsolatedAsyncioTestCase):
                 # Weird formatting here because my editor doesn't like trailing
                 # whitespace, but textwrap dedent requires leading whitespace
                 # on every line, even the empty ones
-                r"""playlist_unique_name
+                r"""playlist_name
 playlist_description
 
 track_name -- artist_one_name, artist_two_name -- album_name
@@ -659,7 +684,7 @@ track_name -- artist_one_name, artist_two_name -- album_name
                     {
                       "description": "playlist_description",
                       "num_followers": 999,
-                      "original_name": "playlist_original_name",
+                      "original_name": "playlist_name",
                       "owner": {
                         "name": "owner_name",
                         "url": "owner_url"
@@ -687,7 +712,7 @@ track_name -- artist_one_name, artist_two_name -- album_name
                           "url": "trackurl"
                         }
                       ],
-                      "unique_name": "playlist_unique_name",
+                      "unique_name": "playlist_name",
                       "url": "playlist_url"
                     }
                     """
@@ -702,7 +727,7 @@ track_name -- artist_one_name, artist_two_name -- album_name
                 # on every line, even the empty ones
                 r"""pretty - [cumulative](/playlists/cumulative/abc.md) - [plain](/playlists/plain/abc) - [githistory](base/plain/abc)
 
-### [playlist\_unique\_name](playlist_url)
+### [playlist\_name](playlist_url)
 
 > playlist\_description
 
@@ -733,36 +758,36 @@ Snapshot ID: `playlist_snapshot_id`
             pass
 
         # Create a fake playlist
-        playlist = Playlist(
+        playlist = SpotifyPlaylist(
             url="playlist_url",
-            original_name="playlist_original_name",
-            unique_name="playlist_unique_name",
+            name="playlist_original_name",
             description="playlist_description",
             tracks=[
-                Track(
+                SpotifyTrack(
                     url="trackurl",
                     name="track_name",
-                    album=Album(
+                    album=SpotifyAlbum(
                         url="album_url",
                         name="album_name",
                     ),
                     artists=[
-                        Artist(
+                        SpotifyArtist(
                             url="artist_one_url",
                             name="artist_one_name",
                         ),
-                        Artist(
+                        SpotifyArtist(
                             url="artist_two_url",
                             name="artist_two_name",
                         ),
                     ],
                     duration_ms=12345,
+                    popularity=71,
                     added_at=self.now,
                 )
             ],
             snapshot_id="playlist_snapshot_id",
             num_followers=999,
-            owner=Owner(
+            owner=SpotifyOwner(
                 url="owner_url",
                 name="owner_name",
             ),
@@ -818,7 +843,7 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
 
         # Use AsyncMocks for async methods
         self.mock_spotify = mock_spotify_class.return_value
-        self.mock_spotify.get_recently_played_tracks = AsyncMock()
+        self.mock_spotify.get_recently_played_tracks.return_value = AsyncMock()
 
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -835,25 +860,29 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
         self,
         track_id: str,
         played_at: datetime.datetime,
-    ) -> RecentlyPlayedTrack:
-        return RecentlyPlayedTrack(
-            url=f"track_url_{track_id}",
-            name=f"track_name_{track_id}",
-            album=Album(
-                url=f"album_url_{track_id}",
-                name=f"album_name_{track_id}",
-            ),
-            artists=[
-                Artist(
-                    url=f"artist_url_{track_id}",
-                    name=f"artist_name_{track_id}",
+    ) -> SpotifyRecentlyPlayedTrack:
+        return SpotifyRecentlyPlayedTrack(
+            track=SpotifyTrack(
+                url=f"track_url_{track_id}",
+                name=f"track_name_{track_id}",
+                album=SpotifyAlbum(
+                    url=f"album_url_{track_id}",
+                    name=f"album_name_{track_id}",
                 ),
-            ],
-            popularity=25,
-            duration_ms=12345,
-            context_type=f"context_type_{track_id}",
-            context_url=f"context_url_{track_id}",
+                artists=[
+                    SpotifyArtist(
+                        url=f"artist_url_{track_id}",
+                        name=f"artist_name_{track_id}",
+                    ),
+                ],
+                popularity=25,
+                duration_ms=12345,
+            ),
             played_at=played_at,
+            context=SpotifyContext(
+                type_=f"context_type_{track_id}",
+                url=f"context_url_{track_id}",
+            ),
         )
 
     async def test_empty(self) -> None:
@@ -864,7 +893,7 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
         await self._update_play_history()
 
     async def test_request_failed(self) -> None:
-        self.mock_spotify.get_recently_played_tracks.side_effect = RequestFailedError
+        self.mock_spotify.get_recently_played_tracks.return_value.__aiter__.side_effect = RequestFailedError
         # Uncategorized request failures should terminate the program
         with self.assertRaises(RequestFailedError):
             await self._update_play_history()
@@ -907,10 +936,13 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
             )
 
         # Have Spotify return a track corresponding to the bad file
-        self.mock_spotify.get_recently_played_tracks.return_value = [
+        batch = [
             self._get_recently_played_track(
                 track_id="a", played_at=datetime.datetime(year=2025, month=4, day=1)
             )
+        ]
+        self.mock_spotify.get_recently_played_tracks.return_value.__aiter__.return_value = [
+            batch
         ]
 
         # Make sure an error is raised
@@ -974,10 +1006,13 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
             )
 
         # Have Spotify return a track corresponding to the bad file
-        self.mock_spotify.get_recently_played_tracks.return_value = [
+        batch = [
             self._get_recently_played_track(
                 track_id="a", played_at=datetime.datetime(year=2025, month=4, day=1)
             )
+        ]
+        self.mock_spotify.get_recently_played_tracks.return_value.__aiter__.return_value = [
+            batch
         ]
 
         # Make sure an error is raised
@@ -989,11 +1024,14 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
         self.assertEqual(sorted(self.history_dir.rglob("*")), [])
 
         # The first call to get_recently_played_tracks returns a single track
-        self.mock_spotify.get_recently_played_tracks.return_value = [
+        batch = [
             self._get_recently_played_track(
                 track_id="a",
                 played_at=datetime.datetime(year=2025, month=4, day=1, hour=12),
             )
+        ]
+        self.mock_spotify.get_recently_played_tracks.return_value.__aiter__.return_value = [
+            batch
         ]
 
         # Call the method being tested
@@ -1056,31 +1094,37 @@ class TestUpdatePlayHistory(IsolatedAsyncioTestCase):
 
         # The second call to get_recently_played_tracks returns multiple
         # tracks, intentionally out of order to test grouping and sorting
-        self.mock_spotify.get_recently_played_tracks.return_value = [
-            # A newer day than before
-            self._get_recently_played_track(
-                track_id="b", played_at=datetime.datetime(year=2025, month=4, day=2)
-            ),
-            # An older day than before
-            self._get_recently_played_track(
-                track_id="c",
-                played_at=datetime.datetime(year=2025, month=3, day=31),
-            ),
-            # The same day as before, exact same time
-            self._get_recently_played_track(
-                track_id="d",
-                played_at=datetime.datetime(year=2025, month=4, day=1, hour=12),
-            ),
-            # The same day as before, 1 hour earlier
-            self._get_recently_played_track(
-                track_id="e",
-                played_at=datetime.datetime(year=2025, month=4, day=1, hour=11),
-            ),
-            # The same day as before, 1 hour later
-            self._get_recently_played_track(
-                track_id="f",
-                played_at=datetime.datetime(year=2025, month=4, day=1, hour=13),
-            ),
+        self.mock_spotify.get_recently_played_tracks.return_value.__aiter__.return_value = [
+            # Suppose the first batch includes three tracks
+            [
+                # A newer day than before
+                self._get_recently_played_track(
+                    track_id="b", played_at=datetime.datetime(year=2025, month=4, day=2)
+                ),
+                # An older day than before
+                self._get_recently_played_track(
+                    track_id="c",
+                    played_at=datetime.datetime(year=2025, month=3, day=31),
+                ),
+                # The same day as before, exact same time
+                self._get_recently_played_track(
+                    track_id="d",
+                    played_at=datetime.datetime(year=2025, month=4, day=1, hour=12),
+                ),
+            ],
+            # The second batch includes the remaining tracks
+            [
+                # The same day as before, 1 hour earlier
+                self._get_recently_played_track(
+                    track_id="e",
+                    played_at=datetime.datetime(year=2025, month=4, day=1, hour=11),
+                ),
+                # The same day as before, 1 hour later
+                self._get_recently_played_track(
+                    track_id="f",
+                    played_at=datetime.datetime(year=2025, month=4, day=1, hour=13),
+                ),
+            ],
         ]
 
         # Call the method being tested

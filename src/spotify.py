@@ -10,26 +10,129 @@ import logging
 from types import TracebackType
 from typing import (
     Any,
+    AsyncIterable,
     Dict,
     List,
+    NamedTuple,
     Optional,
+    Sequence,
     Set,
     Type,
     TypeVar,
 )
 
 import aiohttp
+from pydantic import BaseModel
 
-from alias import Alias
 from plants.cache import Cache, NoCache
 from plants.external import external
 from playlist_id import PlaylistID
-from playlist_types import Album, Artist, Owner, Playlist, RecentlyPlayedTrack, Track
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+
+
+#
+# Public structs returned by the Spotify class
+#
+
+
+class SpotifyOwner(NamedTuple):
+    url: str
+    name: str
+
+
+class SpotifyAlbum(NamedTuple):
+    url: str
+    name: str
+
+
+class SpotifyArtist(NamedTuple):
+    url: str
+    name: str
+
+
+class SpotifyContext(NamedTuple):
+    type_: str
+    url: str
+
+
+class SpotifyTrack(NamedTuple):
+    url: str
+    name: str
+    album: SpotifyAlbum
+    artists: Sequence[SpotifyArtist]
+    duration_ms: int
+    popularity: int
+    added_at: Optional[datetime.datetime] = None
+
+
+class SpotifyPlaylist(NamedTuple):
+    url: str
+    name: str
+    description: str
+    tracks: Sequence[SpotifyTrack]
+    # The unique identifier for a particular playlist version. Note that for
+    # certain personalized playlists, snapshot ID changes with every request
+    # because the timestamp of the request is encoded within the ID.
+    # (https://artists.spotify.com/blog/our-playlist-ecosystem-is-evolving)
+    snapshot_id: str
+    num_followers: Optional[int]
+    owner: SpotifyOwner
+
+
+class SpotifyRecentlyPlayedTrack(NamedTuple):
+    track: SpotifyTrack
+    played_at: datetime.datetime
+    context: Optional[SpotifyContext] = None
+
+
+#
+# Internal structs for parsing Spotify API responses
+#
+
+
+class _SpotifyExternalUrls(BaseModel):
+    spotify: str
+
+
+class _SpotifyContext(BaseModel):
+    type: str
+    external_urls: _SpotifyExternalUrls
+
+
+class _SpotifyAlbum(BaseModel):
+    name: str
+    external_urls: _SpotifyExternalUrls
+
+
+class _SpotifyArtist(BaseModel):
+    name: str
+    external_urls: _SpotifyExternalUrls
+    type: str
+
+
+class _SpotifyTrack(BaseModel):
+    id: str
+    name: str
+    external_urls: _SpotifyExternalUrls
+    duration_ms: int
+    album: _SpotifyAlbum
+    artists: List[_SpotifyArtist]
+    popularity: int
+
+
+class _SpotifyRecentlyPlayedItem(BaseModel):
+    track: _SpotifyTrack
+    played_at: str
+    context: Optional[_SpotifyContext] = None
+
+
+class _SpotifyRecentlyPlayedResponse(BaseModel):
+    items: List[_SpotifyRecentlyPlayedItem]
+    next: Optional[str] = None
 
 
 #
@@ -398,125 +501,98 @@ class Spotify:
 
     # Note: a track is considered "recently played" if it ends naturally,
     # regardless of how much of the track was actually played
-    async def get_recently_played_tracks(self) -> List[RecentlyPlayedTrack]:
-        tracks = []
+    async def get_recently_played_tracks(
+        self,
+    ) -> AsyncIterable[List[SpotifyRecentlyPlayedTrack]]:
         # The maximum tracks per request is 50. And the API will only ever
-        # return the 50 most recent tracks, even if the cursor is set .
+        # return the 50 most recent tracks, even if the cursor is set.
         href = self.BASE_URL + "/me/player/recently-played?limit=50"
         while href:
             data = await self._get_with_retry(href, request_retry_budget=None)
-            tracks += self._parse_recently_played_tracks(data)
-            href = data.get("next")
-        return tracks
+            response = _SpotifyRecentlyPlayedResponse.model_validate(data)
+            batch: List[SpotifyRecentlyPlayedTrack] = []
+            for item in response.items:
+                track = self._parse_recently_played_item(item)
+                if track:
+                    batch.append(track)
+            yield batch
+            href = response.next
 
-    def _parse_recently_played_tracks(
-        self, data: Dict[str, Any]
-    ) -> List[RecentlyPlayedTrack]:
-        tracks: List[RecentlyPlayedTrack] = []
-        items = self._extract(data, "items", list, IfNull.RAISE)
-        for item in items:
-            if not isinstance(item, dict):
-                raise InvalidDataError(f"Invalid item: {item}")
+    @classmethod
+    def _parse_recently_played_item(
+        cls, item: _SpotifyRecentlyPlayedItem
+    ) -> Optional[SpotifyRecentlyPlayedTrack]:
+        track_url = item.track.external_urls.spotify
+        if not track_url:
+            logger.warning("Skipping track with empty URL")
+            return None
 
-            track = self._extract(item, "track", dict, IfNull.COALESCE)
-            if not track:
-                continue
-            track_urls = self._extract(track, "external_urls", dict, IfNull.RAISE)
-            track_url = self._extract(track_urls, "spotify", str, IfNull.COALESCE)
-            if not track_url:
-                logger.warning("Skipping track with empty URL")
-                continue
-            track_name = self._extract(track, "name", str, IfNull.COALESCE)
-            if not track_name:
-                logger.warning(f"Empty track name: {track_url}")
+        track_name = item.track.name
+        if not track_name:
+            logger.warning(f"Empty track name: {track_url}")
 
-            album = self._extract(track, "album", dict, IfNull.RAISE)
-            album_urls = self._extract(album, "external_urls", dict, IfNull.RAISE)
-            album_url = self._extract(album_urls, "spotify", str, IfNull.COALESCE)
-            album_name = self._extract(album, "name", str, IfNull.COALESCE)
-            if not album_name:
-                logger.warning(f"Empty album name: {album_url}")
+        album_url = item.track.album.external_urls.spotify
+        album_name = item.track.album.name
+        if not album_name:
+            logger.warning(f"Empty album name: {album_url}")
 
-            artists = self._extract(track, "artists", list, IfNull.RAISE)
-            artist_objs = []
-            for artist in artists:
-                if not isinstance(artist, dict):
-                    raise InvalidDataError(f"Invalid artist: {artist}")
-                artist_urls = self._extract(artist, "external_urls", dict, IfNull.RAISE)
-                artist_url = self._extract(artist_urls, "spotify", str, IfNull.COALESCE)
-                artist_name = (
-                    self._extract(artist, "name", str, IfNull.COALESCE)
-                    or self._extract(artist, "type", str, IfNull.COALESCE)
-                    or ""
-                )
-                if not artist_name:
-                    logger.warning(f"Empty artist name: {artist_url}")
-                artist_objs.append(Artist(url=artist_url, name=artist_name))
+        artists: List[SpotifyArtist] = []
+        for artist in item.track.artists:
+            artist_url = artist.external_urls.spotify
+            artist_name = artist.name or artist.type
+            if not artist_name:
+                logger.warning(f"Empty artist name: {artist_url}")
+            artists.append(SpotifyArtist(url=artist_url, name=artist_name))
 
-            if not artist_objs:
-                logger.warning(f"Empty track artists: {track_url}")
+        if not artists:
+            logger.warning(f"Empty track artists: {track_url}")
 
-            popularity = self._extract(track, "popularity", int, IfNull.RAISE)
-            duration_ms = self._extract(track, "duration_ms", int, IfNull.RAISE)
+        popularity = item.track.popularity
 
-            # Sometimes, context can be None
-            context = self._extract(item, "context", dict, IfNull.COALESCE)
-            context_type = self._extract(context, "type", str, IfNull.COALESCE)
-            context_urls = self._extract(
-                context, "external_urls", dict, IfNull.COALESCE
-            )
-            context_url = self._extract(context_urls, "spotify", str, IfNull.COALESCE)
+        if item.played_at == "1970-01-01T00:00:00Z":
+            raise InvalidDataError(f"Unexpected sentinel {item.played_at = }")
+        if "." in item.played_at:
+            format_string = "%Y-%m-%dT%H:%M:%S.%fZ"
+        else:
+            format_string = "%Y-%m-%dT%H:%M:%SZ"
+        played_at = datetime.datetime.strptime(item.played_at, format_string)
 
-            played_at_string = self._extract(item, "played_at", str, IfNull.RAISE)
-            if played_at_string == "1970-01-01T00:00:00Z":
-                raise InvalidDataError(f"Unexpected sential {played_at_string = }")
-
-            # Gracefully handle milliseconds not available
-            try:
-                played_at = datetime.datetime.strptime(
-                    played_at_string, "%Y-%m-%dT%H:%M:%S.%fZ"
-                )
-            except ValueError:
-                played_at = datetime.datetime.strptime(
-                    played_at_string, "%Y-%m-%dT%H:%M:%SZ"
-                )
-
-            tracks.append(
-                RecentlyPlayedTrack(
-                    url=track_url,
-                    name=track_name,
-                    album=Album(
-                        url=album_url,
-                        name=album_name,
-                    ),
-                    artists=artist_objs,
-                    popularity=popularity,
-                    duration_ms=duration_ms,
-                    context_type=context_type,
-                    context_url=context_url,
-                    played_at=played_at,
-                )
+        context = None
+        if item.context:
+            context = SpotifyContext(
+                type_=item.context.type,
+                url=item.context.external_urls.spotify,
             )
 
-        return tracks
+        return SpotifyRecentlyPlayedTrack(
+            track=SpotifyTrack(
+                url=track_url,
+                name=track_name,
+                album=SpotifyAlbum(
+                    url=album_url,
+                    name=album_name,
+                ),
+                artists=artists,
+                duration_ms=item.track.duration_ms,
+                popularity=popularity,
+            ),
+            played_at=played_at,
+            context=context,
+        )
 
     async def get_playlist(
         self,
         playlist_id: PlaylistID,
         *,
-        alias: Optional[Alias],
         retry_budget: Optional[RetryBudget] = None,
-    ) -> Playlist:
+    ) -> SpotifyPlaylist:
         href = self._get_playlist_href(playlist_id)
         data = await self._get_with_retry(href, request_retry_budget=retry_budget)
 
         playlist_urls = self._extract(data, "external_urls", dict, IfNull.RAISE)
         playlist_url = self._extract(playlist_urls, "spotify", str, IfNull.COALESCE)
 
-        if alias:
-            name = alias
-        else:
-            name = self._extract(data, "name", str, IfNull.RAISE)
+        name = self._extract(data, "name", str, IfNull.RAISE)
         if not name.strip():
             raise InvalidDataError(f"Empty playlist name: {repr(name)}")
 
@@ -534,20 +610,18 @@ class Spotify:
         if not owner_name:
             logger.warning(f"Empty owner name: {owner_url}")
 
-        return Playlist(
+        tracks: List[SpotifyTrack] = []
+        async for batch in self._get_tracks(playlist_id, retry_budget=retry_budget):
+            tracks += batch
+
+        return SpotifyPlaylist(
             url=playlist_url,
-            original_name=name,
-            # When fetched, playlists are presumed to have unique names. Later
-            # on, if duplicates are discovered, their unique names get updated
-            # so they can be differentiated. It's bit hacky, but it's easier
-            # than defining separate structs for playlists fetched from Spotify
-            # and playlists read from JSON.
-            unique_name=name,
+            name=name,
             description=self._extract(data, "description", str, IfNull.RAISE),
-            tracks=await self._get_tracks(playlist_id, retry_budget=retry_budget),
+            tracks=tracks,
             snapshot_id=self._extract(data, "snapshot_id", str, IfNull.RAISE),
             num_followers=followers_total,
-            owner=Owner(
+            owner=SpotifyOwner(
                 url=owner_url,
                 name=owner_name,
             ),
@@ -555,11 +629,11 @@ class Spotify:
 
     async def _get_tracks(
         self, playlist_id: PlaylistID, *, retry_budget: Optional[RetryBudget] = None
-    ) -> List[Track]:
-        tracks = []
+    ) -> AsyncIterable[List[SpotifyTrack]]:
         href = self._get_tracks_href(playlist_id)
 
         while href:
+            tracks = []
             data = await self._get_with_retry(href, request_retry_budget=retry_budget)
             items = self._extract(data, "items", list, IfNull.RAISE)
             for item in items:
@@ -603,12 +677,13 @@ class Spotify:
                     )
                     if not artist_name:
                         logger.warning(f"Empty artist name: {artist_url}")
-                    artist_objs.append(Artist(url=artist_url, name=artist_name))
+                    artist_objs.append(SpotifyArtist(url=artist_url, name=artist_name))
 
                 if not artist_objs:
                     logger.warning(f"Empty track artists: {track_url}")
 
                 duration_ms = self._extract(track, "duration_ms", int, IfNull.RAISE)
+                popularity = self._extract(track, "popularity", int, IfNull.RAISE)
 
                 added_at_string = self._extract(item, "added_at", str, IfNull.COALESCE)
                 if added_at_string and added_at_string != "1970-01-01T00:00:00Z":
@@ -619,22 +694,22 @@ class Spotify:
                     added_at = None
 
                 tracks.append(
-                    Track(
+                    SpotifyTrack(
                         url=track_url,
                         name=track_name,
-                        album=Album(
+                        album=SpotifyAlbum(
                             url=album_url,
                             name=album_name,
                         ),
                         artists=artist_objs,
                         duration_ms=duration_ms,
+                        popularity=popularity,
                         added_at=added_at,
                     )
                 )
 
+            yield tracks
             href = data.get("next")
-
-        return tracks
 
     @classmethod
     def _extract(
@@ -670,8 +745,8 @@ class Spotify:
     @classmethod
     def _get_tracks_href(cls, playlist_id: PlaylistID) -> str:
         rest = (
-            "{}/tracks?fields=items(added_at,track(id,external_urls,"
-            "duration_ms,name,album(external_urls,name),artists)),next"
+            "{}/tracks?fields=items(added_at,track(id,external_urls,duration_ms,"
+            "popularity,name,album(external_urls,name),artists)),next"
         )
         template = cls.BASE_URL + "/playlists/" + rest
         return template.format(playlist_id)

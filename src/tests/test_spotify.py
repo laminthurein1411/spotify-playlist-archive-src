@@ -11,10 +11,8 @@ from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
 import aiohttp
 
-from alias import Alias
 from plants.unittest_utils import UnittestUtils
 from playlist_id import PlaylistID
-from playlist_types import Album, Artist, Owner, Playlist, Track
 from spotify import (
     AccessTokenError,
     InvalidDataError,
@@ -26,6 +24,11 @@ from spotify import (
     RetryableError,
     RetryBudget,
     Spotify,
+    SpotifyAlbum,
+    SpotifyArtist,
+    SpotifyOwner,
+    SpotifyPlaylist,
+    SpotifyTrack,
 )
 
 
@@ -166,7 +169,7 @@ class TestGetWithRetry(SpotifyTestCase):
         ]:
             self.mock_session.get.return_value.__aenter__.side_effect = type_
             with self.assertRaises(OverallRetryBudgetExceededError):
-                await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+                await self.spotify.get_playlist(PlaylistID("abc123"))
 
     # Patch the logger to suppress log spew
     @patch("spotify.logger")
@@ -178,21 +181,21 @@ class TestGetWithRetry(SpotifyTestCase):
             # Set a smaller retry budget to make the test run quicker
             self.spotify._overall_retry_budget = RetryBudget(seconds=10)
             with self.assertRaises(OverallRetryBudgetExceededError):
-                await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+                await self.spotify.get_playlist(PlaylistID("abc123"))
 
     async def test_playlist_not_found(self) -> None:
         async with self.mock_session.get() as mock_response:
             mock_response.status = 404
             mock_response.json.return_value = {"error": {"message": "Not found."}}
         with self.assertRaises(ResourceNotFoundError):
-            await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+            await self.spotify.get_playlist(PlaylistID("abc123"))
 
     async def test_request_failed(self) -> None:
         async with self.mock_session.get() as mock_response:
             mock_response.status = 402
             mock_response.json.return_value = {"error": None}
         with self.assertRaises(RequestFailedError):
-            await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+            await self.spotify.get_playlist(PlaylistID("abc123"))
 
     # Patch the logger to suppress log spew
     @patch("spotify.logger")
@@ -586,10 +589,10 @@ class TestGetPlaylist(SpotifyTestCase):
             new_callable=AsyncMock,
         )
 
-    @patch("spotify.Spotify._get_tracks", new_callable=AsyncMock)
+    @patch("spotify.Spotify._get_tracks")
     # pyre-fixme[30]
     async def test_invalid_data(self, mock_get_tracks: Mock) -> None:
-        mock_get_tracks.return_value = []
+        mock_get_tracks.return_value.__aiter__.return_value = []
         valid_data = {
             "name": "playlist_name",
             "description": "playlist_description",
@@ -631,51 +634,29 @@ class TestGetPlaylist(SpotifyTestCase):
                     mock_response.status = 200
                     mock_response.json.return_value = data
                 with self.assertRaises(InvalidDataError):
-                    await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+                    await self.spotify.get_playlist(PlaylistID("abc123"))
 
-    @patch("spotify.Spotify._get_tracks", new_callable=AsyncMock)
-    async def test_nonempty_alias(self, mock_get_tracks: AsyncMock) -> None:
-        mock_get_tracks.return_value = []
-        async with self.mock_session.get.return_value as mock_response:
-            mock_response.status = 200
-            mock_response.json.return_value = {
-                "name": "playlist_name",
-                "description": "",
-                "external_urls": {},
-                "snapshot_id": "",
-                "followers": {
-                    "total": 0,
-                },
-                "owner": {
-                    "display_name": "owner_name",
-                    "external_urls": {},
-                },
-            }
-            playlist = await self.spotify.get_playlist(
-                PlaylistID("abc123"), alias=Alias("alias")
-            )
-            self.assertEqual(playlist.original_name, "alias")
-            self.assertEqual(playlist.unique_name, "alias")
-
-    @patch("spotify.Spotify._get_tracks", new_callable=AsyncMock)
-    async def test_success(self, mock_get_tracks: AsyncMock) -> None:
-        track = Track(
+    @patch("spotify.Spotify._get_tracks")
+    async def test_success(self, mock_get_tracks: Mock) -> None:
+        track = SpotifyTrack(
             url="track_url",
             name="track_name",
-            album=Album(
+            album=SpotifyAlbum(
                 url="album_url",
                 name="album_name",
             ),
             artists=[
-                Artist(
+                SpotifyArtist(
                     url="artist_url",
                     name="artist_name",
                 )
             ],
             duration_ms=100,
+            popularity=71,
             added_at=datetime.datetime(2021, 12, 25),
         )
-        mock_get_tracks.return_value = [track]
+        # Return a single batch containing a single track
+        mock_get_tracks.return_value.__aiter__.return_value = [[track]]
         async with self.mock_session.get.return_value as mock_response:
             mock_response.status = 200
             mock_response.json.return_value = {
@@ -695,18 +676,17 @@ class TestGetPlaylist(SpotifyTestCase):
                     },
                 },
             }
-        playlist = await self.spotify.get_playlist(PlaylistID("abc123"), alias=None)
+        playlist = await self.spotify.get_playlist(PlaylistID("abc123"))
         self.assertEqual(
             playlist,
-            Playlist(
+            SpotifyPlaylist(
                 url="playlist_url",
-                original_name="playlist_name",
-                unique_name="playlist_name",
+                name="playlist_name",
                 description="playlist_description",
                 tracks=[track],
                 snapshot_id="playlist_snapshot_id",
                 num_followers=999,
-                owner=Owner(
+                owner=SpotifyOwner(
                     url="owner_url",
                     name="owner_name",
                 ),
@@ -781,7 +761,8 @@ class TestGetTracks(SpotifyTestCase):
                     mock_response.status = 200
                     mock_response.json.return_value = data
                 with self.assertRaises(InvalidDataError):
-                    await self.spotify._get_tracks(PlaylistID("abc123"))
+                    async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+                        pass
 
     async def test_empty_playlist(self) -> None:
         async with self.mock_session.get.return_value as mock_response:
@@ -790,7 +771,9 @@ class TestGetTracks(SpotifyTestCase):
                 "items": [],
                 "next": "",
             }
-        tracks = await self.spotify._get_tracks(PlaylistID("abc123"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+            tracks += batch
         self.assertEqual(tracks, [])
 
     async def test_empty_track(self) -> None:
@@ -800,7 +783,9 @@ class TestGetTracks(SpotifyTestCase):
                 "items": [{"track": {}}],
                 "next": "",
             }
-        tracks = await self.spotify._get_tracks(PlaylistID("abc123"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+            tracks += batch
         self.assertEqual(tracks, [])
 
     # Patch the logger to suppress log spew
@@ -812,7 +797,9 @@ class TestGetTracks(SpotifyTestCase):
                 "items": [{"track": {"external_urls": {"spotify": ""}}}],
                 "next": "",
             }
-        tracks = await self.spotify._get_tracks(PlaylistID("abc123"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+            tracks += batch
         self.assertEqual(tracks, [])
 
     # Patch the logger to suppress log spew
@@ -832,25 +819,29 @@ class TestGetTracks(SpotifyTestCase):
                             },
                             "artists": [],
                             "external_urls": {"spotify": "track_url"},
+                            "popularity": 71,
                         },
                         "added_at": "1970-01-01T00:00:00Z",
                     },
                 ],
                 "next": "",
             }
-        tracks = await self.spotify._get_tracks(PlaylistID("abc123"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+            tracks += batch
         self.assertEqual(
             tracks,
             [
-                Track(
+                SpotifyTrack(
                     url="track_url",
                     name="",
-                    album=Album(
+                    album=SpotifyAlbum(
                         url="",
                         name="",
                     ),
                     artists=[],
                     duration_ms=123,
+                    popularity=71,
                     added_at=None,
                 )
             ],
@@ -888,34 +879,38 @@ class TestGetTracks(SpotifyTestCase):
                             "external_urls": {
                                 "spotify": "track_url",
                             },
+                            "popularity": 71,
                         },
                         "added_at": "2021-12-25T00:00:00Z",
                     },
                 ],
                 "next": "",
             }
-        tracks = await self.spotify._get_tracks(PlaylistID("abc123"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("abc123")):
+            tracks += batch
         self.assertEqual(
             tracks,
             [
-                Track(
+                SpotifyTrack(
                     url="track_url",
                     name="track_name",
-                    album=Album(
+                    album=SpotifyAlbum(
                         url="album_url",
                         name="album_name",
                     ),
                     artists=[
-                        Artist(
+                        SpotifyArtist(
                             name="artist_name_1",
                             url="artist_url_1",
                         ),
-                        Artist(
+                        SpotifyArtist(
                             name="artist_name_2",
                             url="artist_url_2",
                         ),
                     ],
                     duration_ms=456,
+                    popularity=71,
                     added_at=datetime.datetime(2021, 12, 25),
                 )
             ],
@@ -931,7 +926,9 @@ class TestGetTracks(SpotifyTestCase):
                 {"items": [], "next": "c"},
                 {"items": [], "next": ""},
             ]
-        tracks = await self.spotify._get_tracks(PlaylistID("a"))
+        tracks = []
+        async for batch in self.spotify._get_tracks(PlaylistID("a")):
+            tracks += batch
         self.assertEqual(tracks, [])
         self.mock_session.get.assert_has_calls(
             [

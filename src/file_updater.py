@@ -6,7 +6,7 @@ import datetime
 import difflib
 import logging
 import pathlib
-from typing import Any, Dict, NamedTuple, Optional, Set, TypeVar
+from typing import Any, Dict, List, NamedTuple, Optional, Set, TypeVar
 
 import brotli
 
@@ -17,13 +17,22 @@ from plants.cache import Cache
 from plants.environment import Environment
 from plants.logging import Color
 from playlist_id import PlaylistID
-from playlist_types import CumulativePlaylist, PlayHistoryForDate, Playlist
+from playlist_types import (
+    Album,
+    Artist,
+    CumulativePlaylist,
+    Owner,
+    PlayHistoryForDate,
+    Playlist,
+    Track,
+)
 from spotify import (
     InvalidDataError,
     RequestRetryBudgetExceededError,
     ResourceNotFoundError,
     RetryBudget,
     Spotify,
+    SpotifyRecentlyPlayedTrack,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -138,10 +147,43 @@ class FileUpdater:
                 f"- {int(mins)}m {int(secs):02}s) {playlist_id}"
             )
             try:
-                playlists[playlist_id] = await spotify.get_playlist(
+                spotify_playlist = await spotify.get_playlist(
                     playlist_id,
-                    alias=registered_playlists[playlist_id],
                     retry_budget=RetryBudget(seconds=5),
+                )
+                alias = registered_playlists[playlist_id]
+                name = alias or spotify_playlist.name
+                playlists[playlist_id] = Playlist(
+                    url=spotify_playlist.url,
+                    original_name=name,
+                    unique_name=name,
+                    description=spotify_playlist.description,
+                    tracks=[
+                        Track(
+                            url=track.url,
+                            name=track.name,
+                            artists=[
+                                Artist(
+                                    url=artist.url,
+                                    name=artist.name,
+                                )
+                                for artist in track.artists
+                            ],
+                            album=Album(
+                                url=track.album.url,
+                                name=track.album.name,
+                            ),
+                            duration_ms=track.duration_ms,
+                            added_at=track.added_at,
+                        )
+                        for track in spotify_playlist.tracks
+                    ],
+                    snapshot_id=spotify_playlist.snapshot_id,
+                    num_followers=spotify_playlist.num_followers,
+                    owner=Owner(
+                        url=spotify_playlist.owner.url,
+                        name=spotify_playlist.owner.name,
+                    ),
                 )
             # Skip deleted playlists and playlists with invalid data
             except (
@@ -493,7 +535,9 @@ class FileUpdater:
 
         # Get recently played tracks
         logger.info("Getting recently played tracks")
-        recently_played_tracks = await spotify.get_recently_played_tracks()
+        recently_played_tracks: List[SpotifyRecentlyPlayedTrack] = []
+        async for batch in spotify.get_recently_played_tracks():
+            recently_played_tracks += batch
         recently_played_tracks_by_date = collections.defaultdict(list)
         for track in sorted(recently_played_tracks, key=lambda track: track.played_at):
             recently_played_tracks_by_date[track.played_at.date()].append(track)
