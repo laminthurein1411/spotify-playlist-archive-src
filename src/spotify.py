@@ -584,7 +584,7 @@ class Spotify:
                     # "grant_type": "client_credentials",
                     "grant_type": "refresh_token",
                     "refresh_token": client_refresh_token,
-                    "redirect_uri": "http://127.0.0.1:5901/accounts/spotify/login/callback/",  # TODO env
+                    "redirect_uri": "http://127.0.0.1:8888/callback",  # TODO env
                 } if client_refresh_token else {
                     "grant_type": "client_credentials",
                 },
